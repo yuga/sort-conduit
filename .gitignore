@@ -1,0 +1,18 @@
+# backup files
+*#
+*~
+*.swp
+
+# working files
+*.cmi
+*.cmo
+*.annot
+*.exe
+*.hi
+*.o
+*.log
+
+# test or I'm not author of the files
+.dist-buildwrapper
+dist
+example
