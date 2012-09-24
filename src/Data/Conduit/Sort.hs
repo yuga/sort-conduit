@@ -6,11 +6,8 @@
 -- The type to be sorted with this pacakge must be instantiated for class @Sort@.
 
 module Data.Conduit.Sort (
-      -- * The @Sort@ type
-      Sort             -- instances: Eq, Ord
-      
       -- * The @SortOption@ type
-    , SortOption (..)
+      SortOption (..)
     , defaultOption    -- default for SortOption
 
       -- * Sorting
@@ -20,22 +17,14 @@ module Data.Conduit.Sort (
 import Control.Monad (forM_)
 import Control.Monad.Trans (liftIO)
 import Data.Conduit
-import Data.Int
-import Data.Word
 
 import qualified Data.ByteString      as S
-import qualified Data.ByteString.Lazy as L
 import qualified Data.Heap            as H
 import qualified Data.List            as List
 import qualified Data.Monoid          as M
 import qualified Data.Serialize       as SR
 import qualified System.Directory     as FS
 import qualified System.IO            as IO
-
--- |
--- Represents types 'a' that are capable to be sorted.
--- They must be 'Ord' and 'SR.Serialize' instances.
-class (Ord a, SR.Serialize a) => Sort a where {}
 
 -- |
 -- Sort options.
@@ -52,7 +41,7 @@ data TemporaryFile =
         }
     
 -- Private data type that holds states during partial sorting.
-type SortState a = (Sort a) => ([a] -> [a], Int)
+type SortState a = ([a] -> [a], Int)
 
 -- Private data type that holds the head of eache partial sorted data.
 --
@@ -71,11 +60,11 @@ data HeapItem a =
     -- The tempfile holds the handle and path of a temporary file
     -- that stores partial sorted data.
        
-instance Sort a => Eq (HeapItem a) where
+instance Eq a => Eq (HeapItem a) where
     (Item a1 _ _) == (Item a2 _ _) = a1 == a2
     (Item a1 _ _) /= (Item a2 _ _) = a1 /= a2
     
-instance Sort a => Ord (HeapItem a) where
+instance Ord a => Ord (HeapItem a) where
     compare (Item a1 _ _) (Item a2 _ _) = compare a1 a2
     (Item a1 _ _) <  (Item a2 _ _) = a1 <  a2
     (Item a1 _ _) <= (Item a2 _ _) = a1 <= a2
@@ -105,30 +94,32 @@ defaultOption = SO { buffersize = 4 * 1024 * 1024 }
 --
 -- >>> runResourceT $ sourceList ['t','e','s','t'] $= sort defaultOption $$ consume
 -- "estt"
-sort :: (Sort a, MonadResource m)
+sort :: (Ord a, SR.Serialize a, MonadResource m)
      => SortOption
      -> Conduit a m a
 sort opt = partialSortWithFiles opt =$= mergeFiles
 
 -- |
 -- This function splits input, sorts each part indipendently.
-partialSortWithFiles :: (Sort a, MonadResource m)
-     => SortOption 
-     -> Conduit a m TemporaryFile
+partialSortWithFiles :: (Ord a, SR.Serialize a, MonadResource m)
+                     => SortOption 
+                     -> Conduit a m TemporaryFile
 partialSortWithFiles opt =
     loop initState
   where
     initState :: SortState a
     initState = (id, 0)
 
-    loop :: (Sort a, MonadResource m) => SortState a -> Conduit a m TemporaryFile
+    loop :: (Ord a, SR.Serialize a, MonadResource m)
+         => SortState a -> Conduit a m TemporaryFile
     loop state = do
         melement <- await
         case melement of
             Nothing -> close state
             Just element -> push state element
 
-    close :: (Sort a, MonadResource m) => SortState a -> Conduit a m TemporaryFile
+    close :: (Ord a, SR.Serialize a, MonadResource m)
+          => SortState a -> Conduit a m TemporaryFile
     close (front, size)
         | size <= 0 = M.mempty
         | otherwise = do
@@ -136,7 +127,8 @@ partialSortWithFiles opt =
             yield tf
             M.mempty
 
-    push :: (Sort a, MonadResource m) => SortState a -> a -> Conduit a m TemporaryFile
+    push :: (Ord a, SR.Serialize a, MonadResource m)
+         => SortState a -> a -> Conduit a m TemporaryFile
     push (front, size) element
         | newsize < buffersize opt = loop newstate
         | otherwise = do
@@ -147,7 +139,8 @@ partialSortWithFiles opt =
         newsize = size + 1 -- TODO encode後のバイナリサイズで計測する
         newstate = (front . (element:), newsize) -- TODO encode後のバイナリサイズで計測する
     
-    write :: Sort a => [a] -> IO TemporaryFile
+    write :: (Ord a, SR.Serialize a)
+          => [a] -> IO TemporaryFile
     write xs = do
         (filePath, h) <- IO.openBinaryTempFile "." "_temp_.sort"
         mapM_ (S.hPut h . SR.encode) xs
@@ -155,12 +148,12 @@ partialSortWithFiles opt =
 
 -- |
 -- This function merges all temporary files to create one sorted data.
-mergeFiles :: (Sort a, MonadResource m)
+mergeFiles :: (Ord a, SR.Serialize a, MonadResource m)
            => Conduit TemporaryFile m a
 mergeFiles =
     takeInput []
   where
-    takeInput :: (Sort a, MonadResource m)
+    takeInput :: (Ord a, SR.Serialize a, MonadResource m)
               => [TemporaryFile] -> Conduit TemporaryFile m a
     takeInput tfs = do
         mtf <- await
@@ -168,13 +161,13 @@ mergeFiles =
             Nothing -> terminate tfs
             Just tf -> takeInput (tf : tfs)
 
-    terminate :: (Sort a, MonadResource m)
+    terminate :: (Ord a, SR.Serialize a, MonadResource m)
               => [TemporaryFile] -> Conduit TemporaryFile m a
     terminate tfs = do
         heap <- liftIO $ buildHeap tfs
         yields tfs heap
 
-    buildHeap :: Sort a => [TemporaryFile] -> IO (H.MinHeap (HeapItem a))
+    buildHeap :: (Ord a, SR.Serialize a) => [TemporaryFile] -> IO (H.MinHeap (HeapItem a))
     buildHeap tfs = do
         mapM_ (\tf -> IO.hSeek (getHandle tf) IO.AbsoluteSeek 0) tfs
         items <- mapM initItem tfs
@@ -189,7 +182,7 @@ mergeFiles =
                 Nothing   -> heap
                 Just item -> H.insert item heap
 
-    yields :: (Sort a, MonadResource m)
+    yields :: (Ord a, SR.Serialize a, MonadResource m)
            => [TemporaryFile] -> H.MinHeap (HeapItem a) -> Conduit TemporaryFile m a
     yields tfs heap =
         nextheap $ H.view heap
@@ -213,11 +206,11 @@ mergeFiles =
     -- IO (Maybe a) を使わないですますにはデータがないことをあらわすのに例外を使用するとか、
     -- 処理全体が１つのMonadに包まれるようにするなどがあると思う。
     -- 関数内のヘルパーなので、そこまで大掛かりな仕組みを導入するのは不必要 
-    getItem :: Sort a => TemporaryFile -> S.ByteString -> IO (Maybe (HeapItem a))
+    getItem :: SR.Serialize a => TemporaryFile -> S.ByteString -> IO (Maybe (HeapItem a))
     getItem tf =
         get (SR.runGetPartial SR.get)
       where
-        get :: Sort a => (S.ByteString -> SR.Result a) -> S.ByteString -> IO (Maybe (HeapItem a))
+        get :: (S.ByteString -> SR.Result a) -> S.ByteString -> IO (Maybe (HeapItem a))
         get f lo
           | S.null lo = do
               let h = getHandle tf
@@ -233,31 +226,10 @@ mergeFiles =
         toItem (SR.Done r lo') = return $ Just $ Item r lo' tf 
         toItem (SR.Partial continuation) = get continuation S.empty
 
-    close :: (Sort a, MonadResource m)
+    close :: MonadResource m
          => [TemporaryFile] -> Conduit TemporaryFile m a
     close tfs = do
         liftIO $ forM_ tfs $ \tf -> do
             IO.hClose $ getHandle tf
             FS.removeFile $ getPath tf
         M.mempty
-
--------------------------------------------------------------------------------
--- Ready-made instances
-
-instance Sort Bool where {}
-instance Sort Char where {}
-instance Sort Double where {}
-instance Sort Float where {}
-instance Sort Int where {}
-instance Sort Int8 where {}
-instance Sort Int16 where {}
-instance Sort Int32 where {}
-instance Sort Int64 where {}
-instance Sort Integer where {}
-instance Sort Word where {}
-instance Sort Word8 where {}
-instance Sort Word16 where {}
-instance Sort Word32 where {}
-instance Sort Word64 where {}
-instance Sort S.ByteString where {}
-instance Sort L.ByteString where {}
