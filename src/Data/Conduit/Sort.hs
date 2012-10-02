@@ -17,14 +17,19 @@ module Data.Conduit.Sort (
 import Control.Monad (forM_)
 import Control.Monad.Trans (liftIO)
 import Data.Conduit
+--import Debug.Trace
 
-import qualified Data.ByteString      as S
-import qualified Data.Heap            as H
-import qualified Data.List            as List
-import qualified Data.Monoid          as M
-import qualified Data.Serialize       as SR
-import qualified System.Directory     as FS
-import qualified System.IO            as IO
+import qualified Data.ByteString              as S
+import qualified Data.Heap                    as H
+import qualified Data.Monoid                  as M
+import qualified Data.Serialize               as SR
+import qualified Data.Vector                  as V
+import qualified Data.Vector.Algorithms.Intro as VAI
+import qualified Data.Vector.Generic          as G
+import qualified Data.Vector.Generic.Mutable  as GM
+import qualified Data.Vector.Mutable          as VM
+import qualified System.Directory             as FS
+import qualified System.IO                    as IO
 
 -- |
 -- Sort options.
@@ -41,7 +46,7 @@ data TemporaryFile =
         }
     
 -- Private data type that holds states during partial sorting.
-type SortState a = ([a] -> [a], Int)
+type SortState a = (V.Vector a, Int)
 
 -- Private data type that holds the head of eache partial sorted data.
 --
@@ -107,9 +112,9 @@ partialSortWithFiles :: (Ord a, SR.Serialize a, MonadResource m)
 partialSortWithFiles opt =
     loop initState
   where
-    initState :: SortState a
-    initState = (id, 0)
-
+    initState :: (Ord a, SR.Serialize a) => SortState a
+    initState = (G.create (VM.new $ buffersize opt), 0)
+    
     loop :: (Ord a, SR.Serialize a, MonadResource m)
          => SortState a -> Conduit a m TemporaryFile
     loop state = do
@@ -120,30 +125,40 @@ partialSortWithFiles opt =
 
     close :: (Ord a, SR.Serialize a, MonadResource m)
           => SortState a -> Conduit a m TemporaryFile
-    close (front, size)
+    close (v, size)
         | size <= 0 = M.mempty
         | otherwise = do
-            tf <- liftIO $ write $ List.sort $ front [] -- TODO Vecotorを使って書き直す
+            tf <- liftIO $ write $ V.unsafeTake size $ sortv size v        
             yield tf
             M.mempty
 
     push :: (Ord a, SR.Serialize a, MonadResource m)
          => SortState a -> a -> Conduit a m TemporaryFile
-    push (front, size) element
-        | newsize < buffersize opt = loop newstate
+    push (v, size) element
+        | newsize < buffersize opt =
+            loop (setv size element v, newsize)
         | otherwise = do
-            tf <- liftIO $ write $ List.sort $ front [element] -- TODO Vectorを使って書きなおす
+            tf <- liftIO $ write $ V.unsafeTake newsize $
+                sortv newsize $ setv size element v
             yield tf
             loop initState
       where
-        newsize = size + 1 -- TODO encode後のバイナリサイズで計測する
-        newstate = (front . (element:), newsize) -- TODO encode後のバイナリサイズで計測する
-    
-    write :: (Ord a, SR.Serialize a)
-          => [a] -> IO TemporaryFile
-    write xs = do
+        newsize = size + 1
+        
+    setv :: Int -> a -> V.Vector a -> V.Vector a
+    setv size element = V.modify $ \mv ->
+        GM.unsafeWrite mv size element
+        
+    sortv :: (Ord a)
+          => Int -> V.Vector a -> V.Vector a
+    sortv size = V.modify $ \mv ->
+        VAI.sortByBounds compare mv 0 size
+
+    write :: (SR.Serialize a)
+          => V.Vector a -> IO TemporaryFile
+    write v = do
         (filePath, h) <- IO.openBinaryTempFile "." "_temp_.sort"
-        mapM_ (S.hPut h . SR.encode) xs
+        V.mapM_ (S.hPut h . SR.encode) v
         return $ TempFile filePath h
 
 -- |
