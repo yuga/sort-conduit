@@ -1,4 +1,5 @@
 {-# LANGUAGE Rank2Types #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- |
 -- This package provides the function to sort arbitrary type of data.
@@ -33,8 +34,10 @@ import qualified System.IO                    as IO
 
 -- |
 -- Sort options.
-data SortOption =
-    SO  { buffersize :: Int
+data SortOption a =
+    SO  { soBufferSize :: Int
+        , soGet        :: SR.Get a
+        , soPut        :: SR.Putter a
         }
 
 -- Private data type that holds information of temporary files.
@@ -83,9 +86,21 @@ instance Ord a => Ord (HeapItem a) where
         | otherwise = t2
 
 -- |
--- The default sort option.
-defaultOption :: SortOption
-defaultOption = SO { buffersize = 4 * 1024 * 1024 }
+-- The default sort option associated with Data.Serialize.
+-- You can also write an original default option function with Data.SafeCopy
+-- such that:
+--
+--     defaultOption :: (SafeCopy a) => SortOption a
+--     defaultOption =
+--         SO { soBufferSize = 4 * 1024 * 1024
+--            , soGet = safeGet
+--            , soPut = safePut}
+--
+defaultOption :: (SR.Serialize a) => SortOption a
+defaultOption =
+    SO { soBufferSize = 4 * 1024 * 1024
+       , soGet = SR.get
+       , soPut = SR.put }
 
 -- |
 -- Sort arbitrary type of data in a way like the sort command in unix.
@@ -99,23 +114,23 @@ defaultOption = SO { buffersize = 4 * 1024 * 1024 }
 --
 -- >>> runResourceT $ sourceList ['t','e','s','t'] $= sort defaultOption $$ consume
 -- "estt"
-sort :: (Ord a, SR.Serialize a, MonadResource m)
-     => SortOption
+sort :: (Ord a, MonadResource m)
+     => SortOption a
      -> Conduit a m a
-sort opt = partialSortWithFiles opt =$= mergeFiles
+sort opt = partialSortWithFiles opt =$= mergeFiles opt
 
 -- |
 -- This function splits input, sorts each part indipendently.
-partialSortWithFiles :: (Ord a, SR.Serialize a, MonadResource m)
-                     => SortOption 
+partialSortWithFiles :: forall a m. (Ord a, MonadResource m)
+                     => SortOption a
                      -> Conduit a m TemporaryFile
 partialSortWithFiles opt =
     loop initState
   where
-    initState :: (Ord a, SR.Serialize a) => SortState a
-    initState = (G.create (VM.new $ buffersize opt), 0)
+    initState :: (Ord a) => SortState a
+    initState = (G.create (VM.new $ soBufferSize opt), 0)
     
-    loop :: (Ord a, SR.Serialize a, MonadResource m)
+    loop :: (Ord a, MonadResource m)
          => SortState a -> Conduit a m TemporaryFile
     loop state = do
         melement <- await
@@ -123,7 +138,7 @@ partialSortWithFiles opt =
             Nothing -> close state
             Just element -> push state element
 
-    close :: (Ord a, SR.Serialize a, MonadResource m)
+    close :: (Ord a, MonadResource m)
           => SortState a -> Conduit a m TemporaryFile
     close (v, size)
         | size <= 0 = M.mempty
@@ -132,10 +147,10 @@ partialSortWithFiles opt =
             yield tf
             M.mempty
 
-    push :: (Ord a, SR.Serialize a, MonadResource m)
+    push :: (Ord a, MonadResource m)
          => SortState a -> a -> Conduit a m TemporaryFile
     push (v, size) element
-        | newsize < buffersize opt =
+        | newsize < soBufferSize opt =
             loop (setv size element v, newsize)
         | otherwise = do
             tf <- liftIO $ write $ V.unsafeTake newsize $
@@ -154,21 +169,24 @@ partialSortWithFiles opt =
     sortv size = V.modify $ \mv ->
         VAI.sortByBounds compare mv 0 size
 
-    write :: (SR.Serialize a)
-          => V.Vector a -> IO TemporaryFile
+    write :: V.Vector a -> IO TemporaryFile
     write v = do
         (filePath, h) <- IO.openBinaryTempFile "." "_temp_.sort"
-        V.mapM_ (S.hPut h . SR.encode) v
+        V.mapM_ (S.hPut h . encode) v
         return $ TempFile filePath h
+
+    encode :: a -> S.ByteString
+    encode = SR.runPut . (soPut opt)
 
 -- |
 -- This function merges all temporary files to create one sorted data.
-mergeFiles :: (Ord a, SR.Serialize a, MonadResource m)
-           => Conduit TemporaryFile m a
-mergeFiles =
+mergeFiles :: forall a m. (Ord a, MonadResource m)
+           => SortOption a
+           -> Conduit TemporaryFile m a
+mergeFiles opt =
     takeInput []
   where
-    takeInput :: (Ord a, SR.Serialize a, MonadResource m)
+    takeInput :: (Ord a, MonadResource m)
               => [TemporaryFile] -> Conduit TemporaryFile m a
     takeInput tfs = do
         mtf <- await
@@ -176,13 +194,13 @@ mergeFiles =
             Nothing -> terminate tfs
             Just tf -> takeInput (tf : tfs)
 
-    terminate :: (Ord a, SR.Serialize a, MonadResource m)
+    terminate :: (Ord a, MonadResource m)
               => [TemporaryFile] -> Conduit TemporaryFile m a
     terminate tfs = do
         heap <- liftIO $ buildHeap tfs
         yields tfs heap
 
-    buildHeap :: (Ord a, SR.Serialize a) => [TemporaryFile] -> IO (H.MinHeap (HeapItem a))
+    buildHeap :: (Ord a) => [TemporaryFile] -> IO (H.MinHeap (HeapItem a))
     buildHeap tfs = do
         mapM_ (\tf -> IO.hSeek (getHandle tf) IO.AbsoluteSeek 0) tfs
         items <- mapM initItem tfs
@@ -197,7 +215,7 @@ mergeFiles =
                 Nothing   -> heap
                 Just item -> H.insert item heap
 
-    yields :: (Ord a, SR.Serialize a, MonadResource m)
+    yields :: (Ord a, MonadResource m)
            => [TemporaryFile] -> H.MinHeap (HeapItem a) -> Conduit TemporaryFile m a
     yields tfs heap =
         nextheap $ H.view heap
@@ -221,9 +239,9 @@ mergeFiles =
     -- IO (Maybe a) を使わないですますにはデータがないことをあらわすのに例外を使用するとか、
     -- 処理全体が１つのMonadに包まれるようにするなどがあると思う。
     -- 関数内のヘルパーなので、そこまで大掛かりな仕組みを導入するのは不必要 
-    getItem :: SR.Serialize a => TemporaryFile -> S.ByteString -> IO (Maybe (HeapItem a))
+    getItem :: TemporaryFile -> S.ByteString -> IO (Maybe (HeapItem a))
     getItem tf =
-        get (SR.runGetPartial SR.get)
+        get decode
       where
         get :: (S.ByteString -> SR.Result a) -> S.ByteString -> IO (Maybe (HeapItem a))
         get f lo
@@ -240,6 +258,9 @@ mergeFiles =
         toItem (SR.Fail message) = error message -- TODO オプションで変更できるようにする?
         toItem (SR.Done r lo') = return $ Just $ Item r lo' tf 
         toItem (SR.Partial continuation) = get continuation S.empty
+
+    decode :: S.ByteString -> SR.Result a
+    decode = SR.runGetPartial (soGet opt)
 
     close :: MonadResource m
          => [TemporaryFile] -> Conduit TemporaryFile m a

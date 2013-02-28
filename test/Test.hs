@@ -1,5 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DefaultSignatures #-}
 
 module Main where
 
@@ -13,9 +15,29 @@ import System.Random
 
 import qualified Data.ByteString as S
 import qualified Data.List       as List
+import qualified Data.SafeCopy   as SC
 
 type Index = Int
 type Value = Int
+
+{-
+data Shelf a = Shelf a a
+
+instance (Eq a) => Eq (Shelf a) where
+  (Shelf x1 _) == (Shelf x2 _) = x1 == x2 
+  (Shelf x1 _) /= (Shelf x2 _) = x1 /= x2
+
+instance (Ord a) => Ord (Shelf a) where
+  compare (Shelf x1 _) (Shelf x2 _) = compare x1 x2
+
+instance (Serialize a) => Serialize (Shelf a)
+-}
+
+defaultOptionSafe :: (SC.SafeCopy a) => SortOption a
+defaultOptionSafe =
+    SO { soBufferSize = 4 * 1024 * 1024
+       , soGet = SC.safeGet
+       , soPut = SC.safePut }
 
 main :: IO ()
 main = do
@@ -60,7 +82,7 @@ test2 =
                  `shouldReturn` ["(1) first", "(2) third", "(3) first" :: String]
       where
         execSort d = runResourceT $ sourceList d $= sort minimumOption $$ consume
-        minimumOption = SO 10
+        minimumOption = defaultOption { soBufferSize = 10 }
 
 test3 :: [Value] -> Spec
 test3 vs =
@@ -76,5 +98,20 @@ test3 vs =
                  `shouldReturn` List.sort vs
       where
         execSort d = runResourceT $ sourceList d $= sort minimumOption $$ consume
-        minimumOption = SO 10
+        minimumOption = defaultOption { soBufferSize = 10 }
         
+test4 :: [Value] -> Spec
+test4 vs =
+    describe "sort short int list with minimum option using SafeCopy" $ do
+        it "sort an empty list" $
+            execSort ([]:: [Value])
+                `shouldReturn` []
+        it "sort a value" $
+            execSort ([3] :: [Value])
+                 `shouldReturn` [3]
+        it "sort multiple values" $
+            execSort vs
+                 `shouldReturn` List.sort vs
+      where
+        execSort d = runResourceT $ sourceList d $= sort minimumOption $$ consume
+        minimumOption = defaultOptionSafe { soBufferSize = 10 }
